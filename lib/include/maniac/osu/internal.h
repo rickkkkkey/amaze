@@ -1,6 +1,7 @@
 #pragma once
 
 #include <iostream>
+#include <algorithm>
 
 constexpr auto OSU_STATUS_IN_MENU = 0;
 constexpr auto OSU_STATUS_PLAYING = 2;
@@ -33,21 +34,54 @@ public:
 
 private:
 	[[nodiscard]] int32_t get_start_time() const {
-		return process->read_memory<int32_t>(base + 0x10);
+		if (!base) return 0;
+		// Probing primary offset 0x10, fallback 0x14
+		int32_t t = 0;
+		if (process->read_memory<int32_t>(base + 0x10, &t) && t >= -100000 && t <= 3600000) {
+			return t;
+		}
+		if (process->read_memory<int32_t>(base + 0x14, &t) && t >= -100000 && t <= 3600000) {
+			return t;
+		}
+		return 0;
 	}
 
 	[[nodiscard]] int32_t get_end_time() const {
-		return process->read_memory<int32_t>(base + 0x14);
+		if (!base) return 0;
+		int32_t t = 0;
+		if (process->read_memory<int32_t>(base + 0x14, &t) && t >= -100000 && t <= 3600000) {
+			return t;
+		}
+		if (process->read_memory<int32_t>(base + 0x18, &t) && t >= -100000 && t <= 3600000) {
+			return t;
+		}
+		return get_start_time();
 	}
 
 	[[nodiscard]] int32_t get_type() const {
+		if (!base) return 0;
 		return process->read_memory<int32_t>(base + 0x18);
 	}
 
 	[[nodiscard]] int32_t get_column() const {
-		// Try column offset 0x9C, fallback to calculating via X-coordinate if needed
-		int32_t col = process->read_memory<int32_t>(base + 0x9C);
-		return (col >= 0 && col <= 18) ? col : 0;
+		if (!base) return 0;
+
+		// 1. Check raw mania column property
+		int32_t col = 0;
+		if (process->read_memory<int32_t>(base + 0x9C, &col) && col >= 0 && col <= 18) {
+			return col;
+		}
+		if (process->read_memory<int32_t>(base + 0xA0, &col) && col >= 0 && col <= 18) {
+			return col;
+		}
+
+		// 2. Fallback: calculate column from hit object X position (float at 0x38 or 0x3C)
+		float x_pos = 0.0f;
+		if (process->read_memory<float>(base + 0x38, &x_pos) && x_pos >= 0.0f && x_pos <= 512.0f) {
+			return static_cast<int32_t>(std::floor((x_pos * 4.0f) / 512.0f));
+		}
+
+		return 0;
 	}
 };
 
@@ -97,20 +131,15 @@ struct list_container {
 
 struct hit_manager_headers {
 	uintptr_t base;
-
 	int column_count;
 
-	explicit hit_manager_headers(uintptr_t base) : base(base),
-		column_count(get_column_count()) {}
+	explicit hit_manager_headers(uintptr_t base) : base(base), column_count(get_column_count()) {}
 
 	[[nodiscard]] int get_column_count() const {
 		if (!base) return 4;
 		
 		float cs = 0.0f;
 		if (process->read_memory<float>(base + 0x30, &cs) && cs >= 1.0f && cs <= 18.0f) {
-			return static_cast<int>(cs);
-		}
-		if (process->read_memory<float>(base + 0x2C, &cs) && cs >= 1.0f && cs <= 18.0f) {
 			return static_cast<int>(cs);
 		}
 		return 4;
@@ -133,17 +162,26 @@ struct hit_manager {
 	[[nodiscard]] list_container<hit_object> get_list() const {
 		if (!base) return list_container<hit_object>(0);
 
-		// Deep probe every 4-byte aligned offset inside HitObjectManager for a valid .NET List
-		for (uintptr_t offset = 0x20; offset <= 0x80; offset += 0x4) {
+		// Prioritize primary HitObject list offsets: 0x48, 0x40, 0x44
+		for (const auto offset : { 0x48, 0x40, 0x44, 0x3C, 0x50 }) {
 			uintptr_t list_ptr = 0;
 			if (process->read_memory<uintptr_t>(base + offset, &list_ptr) && list_ptr > 0x10000) {
 				int32_t count = 0;
-				if (process->read_memory<int32_t>(list_ptr + 0xC, &count) && count > 0 && count < 100000) {
+				if (process->read_memory<int32_t>(list_ptr + 0xC, &count) && count > 50 && count < 100000) {
 					uintptr_t items_arr = 0;
 					if (process->read_memory<uintptr_t>(list_ptr + 0x4, &items_arr) && items_arr > 0x10000) {
-						std::cout << "[Maniac::Internal] HitObjects list found at offset 0x" 
-						          << std::hex << offset << " (Count: " << std::dec << count << ")" << std::endl;
-						return list_container<hit_object>(list_ptr);
+						// Validate that the first element in this candidate list has a valid start_time
+						uintptr_t first_item = 0;
+						if (process->read_memory<uintptr_t>(items_arr + 0x8, &first_item) && first_item > 0x10000) {
+							int32_t test_time = 0;
+							process->read_memory<int32_t>(first_item + 0x10, &test_time);
+							if (test_time > 0 && test_time < 3600000) {
+								std::cout << "[Maniac::Internal] Valid HitObjects list found at offset 0x" 
+								          << std::hex << offset << " (Count: " << std::dec << count 
+								          << ", First Note: " << test_time << " ms)" << std::endl;
+								return list_container<hit_object>(list_ptr);
+							}
+						}
 					}
 				}
 			}
@@ -154,7 +192,6 @@ struct hit_manager {
 
 struct map_player {
 	uintptr_t base;
-
 	hit_manager manager;
 
 	explicit map_player(uintptr_t base) : base(base), manager(get_hit_manager()) {}
@@ -162,23 +199,17 @@ struct map_player {
 	[[nodiscard]] hit_manager get_hit_manager() const {
 		if (!base) return hit_manager(0);
 
-		// Probe offsets in Player to find the HitObjectManager instance containing a valid list
-		for (uintptr_t offset = 0x30; offset <= 0x60; offset += 0x4) {
+		// Check primary HitObjectManager container offsets on Player: 0x40, 0x48, 0x44, 0x38
+		for (const auto offset : { 0x40, 0x48, 0x44, 0x38, 0x30, 0x50 }) {
 			uintptr_t hm_ptr = 0;
 			if (process->read_memory<uintptr_t>(base + offset, &hm_ptr) && hm_ptr > 0x10000) {
 				hit_manager candidate(hm_ptr);
 				if (!candidate.list.content.empty()) {
-					std::cout << "[Maniac::Internal] HitObjectManager resolved at Player+0x" 
+					std::cout << "[Maniac::Internal] HitObjectManager confirmed at Player+0x" 
 					          << std::hex << offset << std::dec << std::endl;
 					return candidate;
 				}
 			}
-		}
-
-		// Fallback: Player itself might directly host the HitObjectManager structure
-		hit_manager direct(base);
-		if (!direct.list.content.empty()) {
-			return direct;
 		}
 
 		return hit_manager(0);
