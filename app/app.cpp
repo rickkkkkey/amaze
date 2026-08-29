@@ -91,11 +91,7 @@ int main(int, char **) {
 
         maniac::randomize(hit_objects, maniac::config.randomization_mean, maniac::config.randomization_stddev);
 
-        if (maniac::config.humanization_type == maniac::config::STATIC_HUMANIZATION) {
-            maniac::humanize_static(hit_objects, maniac::config.humanization_modifier);
-        }
-
-        if (maniac::config.humanization_type == maniac::config::DYNAMIC_HUMANIZATION) {
+        if (maniac::config.humanization_modifier > 0) {
             maniac::humanize_dynamic(hit_objects, maniac::config.humanization_modifier);
         }
 
@@ -142,17 +138,13 @@ int main(int, char **) {
         ImGui::Text("Status: %s", message.c_str());
         horizontal_break();
 
-        ImGui::Combo("Humanization Type", &maniac::config.humanization_type, "Static\0Dynamic (new)\0\0");
+        ImGui::InputInt("Humanization", &maniac::config.humanization_modifier, 5, 20);
         ImGui::SameLine();
-        help_marker("Static: Density calculated per 1s chunk and applied to all hit objects in that chunk. Dynamic: Density 1s 'in front' of each hit object, applied individually.");
-
-        ImGui::InputInt("Humanization", &maniac::config.humanization_modifier, 0, 1000);
-        ImGui::SameLine();
-        help_marker("Advanced hit-time randomization based on hit density.");
+        help_marker("Dynamic humanization scale (recommended: 30 - 100). Models motor lag, hand separation, density variance, and slider hold decay.");
 
         horizontal_break();
 
-        ImGui::Text("Adds a random hit-time offset generated using a normal \ndistribution with given mean and standard deviation.");
+        ImGui::Text("Adds a static random hit-time offset along a normal distribution:");
         ImGui::Dummy(ImVec2(0.0f, 2.0f));
 
         ImGui::InputInt("Randomization Mean", &maniac::config.randomization_mean);
