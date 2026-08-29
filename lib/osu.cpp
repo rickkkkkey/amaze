@@ -1,4 +1,5 @@
 #include <maniac/osu.h>
+#include <iostream>
 
 using namespace osu;
 
@@ -7,12 +8,15 @@ Osu::Osu() : Process("osu!.exe") {
 
 	base_address = find_signature(signatures::base);
 	debug("found base address: %#x", base_address);
+	std::cout << "[Maniac::Osu] Base address: 0x" << std::hex << base_address << std::dec << std::endl;
 
 	status_address = find_signature(signatures::status);
 	debug("found status address: %#x", status_address);
+	std::cout << "[Maniac::Osu] Status address: 0x" << std::hex << status_address << std::dec << std::endl;
 
 	ruleset_address = find_signature(signatures::ruleset);
 	debug("found ruleset address: %#x", ruleset_address);
+	std::cout << "[Maniac::Osu] Ruleset address: 0x" << std::hex << ruleset_address << std::dec << std::endl;
 
 	if (!base_address || !status_address || !ruleset_address) {
 		throw std::runtime_error("failed to find one or more signatures");
@@ -24,14 +28,21 @@ Osu::~Osu() = default;
 uintptr_t Osu::get_player() {
 	if (!ruleset_address) return 0;
 
-	// CurrentRuleset: dereference [ruleset_address + 0xB], then dereference + 0x4
+	// CurrentRuleset: dereference [ruleset_address + 0xB], then read pointer at + 0x4
 	uintptr_t ruleset_instance = 0;
 	if (!read_memory<uintptr_t>(ruleset_address + 0xB, &ruleset_instance) || !ruleset_instance) {
+		std::cout << "[Maniac::Osu] Failed reading ruleset instance pointer at 0x"
+		          << std::hex << (ruleset_address + 0xB) << std::dec << std::endl;
 		return 0;
 	}
 
 	uintptr_t player = 0;
-	read_memory<uintptr_t>(ruleset_instance + 0x4, &player);
+	if (!read_memory<uintptr_t>(ruleset_instance + 0x4, &player) || !player) {
+		std::cout << "[Maniac::Osu] Failed reading player pointer at 0x"
+		          << std::hex << (ruleset_instance + 0x4) << std::dec << std::endl;
+		return 0;
+	}
+
 	return player;
 }
 
@@ -80,11 +91,21 @@ std::vector<HitObject> Osu::get_hit_objects() {
 		throw std::runtime_error("could not resolve player address");
 	}
 
+	std::cout << "[Maniac::Osu] Attempting to map Player object at 0x"
+	          << std::hex << player_address << std::dec << "..." << std::endl;
+
 	try {
 		const auto player = internal::map_player(player_address);
+		const auto count = player.manager.list.content.size();
+
+		std::cout << "[Maniac::Osu] HitObjectManager mapped. Note count: "
+		          << count << std::endl;
 
 		return player.manager.list.content;
 	} catch (std::runtime_error &err) {
+		std::cout << "[Maniac::Osu] map_player failed: " << err.what()
+		          << " (rescanning ruleset signature)" << std::endl;
+
 		debug("failed getting map player, rescanning ruleset");
 		ruleset_address = find_signature(signatures::ruleset);
 
