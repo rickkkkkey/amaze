@@ -4,6 +4,7 @@
 #include <windows.h>
 #include <iostream>
 #include <cstdio>
+#include <algorithm>
 
 static void help_marker(const char *desc) {
     ImGui::TextDisabled("(?)");
@@ -78,6 +79,14 @@ int main(int, char **) {
             throw std::runtime_error("failed getting hit objects (list was empty)");
         }
 
+        // Print first 3 hit objects for sanity check
+        for (size_t i = 0; i < (std::min)(static_cast<size_t>(3), hit_objects.size()); ++i) {
+            std::cout << "[Maniac::Debug] Note " << i 
+                      << " -> Column: " << hit_objects[i].column 
+                      << " | Start: " << hit_objects[i].start_time 
+                      << " | End: " << hit_objects[i].end_time << std::endl;
+        }
+
         set_priority_class(HIGH_PRIORITY_CLASS);
 
         maniac::randomize(hit_objects, maniac::config.randomization_mean, maniac::config.randomization_stddev);
@@ -97,6 +106,9 @@ int main(int, char **) {
         std::cout << "[Maniac] Generated " << actions.size() << " key actions. Starting playback loop..." << std::endl;
 
         message = "playing";
+
+        std::cout << "[Maniac::Debug] Current live game time right before play(): " 
+                  << osu.get_game_time() << " ms" << std::endl;
 
         maniac::play(actions);
 
