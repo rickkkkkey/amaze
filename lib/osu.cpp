@@ -5,25 +5,37 @@ using namespace osu;
 Osu::Osu() : Process("osu!.exe") {
 	using namespace signatures;
 
-	// TODO: This fails with an unhelpful error when the pattern wasn't found, refactor.
+	base_address = find_signature(signatures::base);
+	debug("found base address: %#x", base_address);
 
-    time_address = read_memory<uintptr_t>(find_signature(signatures::time));
-    debug("found time address: %#x", time_address);
+	status_address = find_signature(signatures::status);
+	debug("found status address: %#x", status_address);
 
-    player_pointer = read_memory<uintptr_t>(find_signature(signatures::player));
-    debug("found player pointer: %#x", player_pointer);
+	ruleset_address = find_signature(signatures::ruleset);
+	debug("found ruleset address: %#x", ruleset_address);
 
-    status_pointer = read_memory<uintptr_t>(find_signature(signatures::status));
-    debug("found status pointer: %#x", status_pointer);
+	if (!base_address || !status_address || !ruleset_address) {
+		throw std::runtime_error("failed to find one or more signatures");
+	}
 }
 
 Osu::~Osu() = default;
 
-std::string Osu::get_key_subset(const std::string &keys, int column_count) {
-	// TODO: This is straight from maniac 0.x and needs to be refactored.
-	//       Probably best to just have a dictionary of subsets for every
-	//       reasonable column count.
+uintptr_t Osu::get_player() {
+	if (!ruleset_address) return 0;
 
+	// CurrentRuleset: dereference [ruleset_address + 0xB], then dereference + 0x4
+	uintptr_t ruleset_instance = 0;
+	if (!read_memory<uintptr_t>(ruleset_address + 0xB, &ruleset_instance) || !ruleset_instance) {
+		return 0;
+	}
+
+	uintptr_t player = 0;
+	read_memory<uintptr_t>(ruleset_instance + 0x4, &player);
+	return player;
+}
+
+std::string Osu::get_key_subset(const std::string &keys, int column_count) {
 	if (column_count > 9) {
 		throw std::runtime_error("maps with more than 9 columns are not supported");
 	}
@@ -61,21 +73,21 @@ std::string Osu::get_key_subset(const std::string &keys, int column_count) {
 }
 
 std::vector<HitObject> Osu::get_hit_objects() {
-    internal::process = this;
+	internal::process = this;
 
-    const auto player_address = read_memory_safe<uintptr_t>("player", player_pointer);
+	const auto player_address = get_player();
+	if (!player_address) {
+		throw std::runtime_error("could not resolve player address");
+	}
 
-    try {
-        const auto player = internal::map_player(player_address);
+	try {
+		const auto player = internal::map_player(player_address);
 
-        return player.manager.list.content;
-    } catch (std::runtime_error &err) {
-        // if this fails, it's very likely because we previously scanned an outdated map player so just rescan
-        debug("failed getting map player, rescanning")
-        player_pointer = read_memory<uintptr_t>(find_signature(signatures::player));
+		return player.manager.list.content;
+	} catch (std::runtime_error &err) {
+		debug("failed getting map player, rescanning ruleset");
+		ruleset_address = find_signature(signatures::ruleset);
 
-        // TODO: Break recursion at some point if it keeps failing, maybe exponential back off for some
-        //       time and then fatal error.
-        return get_hit_objects();
-    }
+		return get_hit_objects();
+	}
 }
