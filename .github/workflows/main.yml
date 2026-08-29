@@ -5,7 +5,7 @@ on: push
 jobs:
   build:
     name: Build for Windows
-    runs-on: windows-latest
+    runs-on: windows-2022
 
     steps:
     - uses: actions/checkout@v4
@@ -18,17 +18,15 @@ jobs:
       with:
         arch: x86
 
-    - name: Configure CMake
-      run: |
-        cmake -B build -G "Visual Studio 17 2022" -A Win32
-
     - name: Build Debug Executable
       run: |
-        cmake --build build --config Debug
+        cmake -B build-dbg -G "Ninja" -DCMAKE_BUILD_TYPE=Debug
+        cmake --build build-dbg
 
     - name: Build Release Executable
       run: |
-        cmake --build build --config Release
+        cmake -B build-rel -G "Ninja" -DCMAKE_BUILD_TYPE=Release
+        cmake --build build-rel
 
     - name: Package Builds
       shell: pwsh
@@ -36,21 +34,17 @@ jobs:
         New-Item -ItemType Directory -Force -Path builds
         
         # Locate and copy debug exe
-        $dbg = Get-ChildItem -Path build -Filter "*.exe" -Recurse | Where-Object { $_.FullName -match "Debug" } | Select-Object -First 1
+        $dbg = Get-ChildItem -Path build-dbg -Filter "*.exe" -Recurse | Select-Object -First 1
         if ($dbg) { 
             Copy-Item $dbg.FullName -Destination "builds/maniac-dbg.exe" 
             Write-Host "Found debug executable at: $($dbg.FullName)"
-        } else {
-            Write-Error "Could not find debug executable!"
         }
 
         # Locate and copy release exe
-        $rel = Get-ChildItem -Path build -Filter "*.exe" -Recurse | Where-Object { $_.FullName -match "Release" } | Select-Object -First 1
+        $rel = Get-ChildItem -Path build-rel -Filter "*.exe" -Recurse | Select-Object -First 1
         if ($rel) { 
             Copy-Item $rel.FullName -Destination "builds/maniac-prd.exe" 
             Write-Host "Found release executable at: $($rel.FullName)"
-        } else {
-            Write-Error "Could not find release executable!"
         }
 
     - name: Upload builds folder as artifact
