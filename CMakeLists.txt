@@ -5,6 +5,9 @@ if (UNIX)
     message(FATAL_ERROR "UNIX systems are currently not supported")
 endif ()
 
+# Prevent Windows headers from defining min/max macros globally
+add_compile_definitions(NOMINMAX)
+
 # Only do these if this is the main project, not if it is included through add_subdirectory
 if(CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME)
     # Optionally set things like CMAKE_CXX_STANDARD, CMAKE_POSITION_INDEPENDENT_CODE here
