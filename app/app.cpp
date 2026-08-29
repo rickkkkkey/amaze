@@ -1,6 +1,9 @@
 #include "window.h"
 #include "config.h"
 #include <maniac/maniac.h>
+#include <windows.h>
+#include <iostream>
+#include <cstdio>
 
 static void help_marker(const char *desc) {
     ImGui::TextDisabled("(?)");
@@ -32,6 +35,13 @@ static void set_priority_class(int priority) {
 }
 
 int main(int, char **) {
+    // Open a debug console window alongside the UI
+    AllocConsole();
+    FILE *fDummy;
+    freopen_s(&fDummy, "CONOUT$", "w", stdout);
+    freopen_s(&fDummy, "CONOUT$", "w", stderr);
+    std::cout << "=== Maniac Debug Console Initialized ===" << std::endl;
+
     std::string message;
 
     config::read_from_file(maniac::config);
@@ -40,27 +50,32 @@ int main(int, char **) {
         maniac::osu = &osu;
 
         message = "waiting for beatmap...";
+        std::cout << "[Maniac] Waiting for playing status (current status: " << osu.get_status() << ")..." << std::endl;
 
         maniac::block_until_playing();
 
         message = "found beatmap";
+        std::cout << "[Maniac] Entered gameplay! Resolving hit objects..." << std::endl;
 
         std::vector<osu::HitObject> hit_objects;
 
         for (int i = 0; i < 10; i++) {
             try {
                 hit_objects = osu.get_hit_objects();
-
-                break;
+                if (!hit_objects.empty()) {
+                    break;
+                }
             } catch (std::exception &err) {
                 debug("get hit objects attempt %d failed: %s", i + 1, err.what());
-
-                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                std::cout << "[Maniac] Attempt " << (i + 1) << " to get hit objects failed: " << err.what() << std::endl;
             }
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
         }
 
+        std::cout << "[Maniac] Loaded " << hit_objects.size() << " hit objects from memory." << std::endl;
+
         if (hit_objects.empty()) {
-            throw std::runtime_error("failed getting hit objects");
+            throw std::runtime_error("failed getting hit objects (list was empty)");
         }
 
         set_priority_class(HIGH_PRIORITY_CLASS);
@@ -75,11 +90,17 @@ int main(int, char **) {
             maniac::humanize_dynamic(hit_objects, maniac::config.humanization_modifier);
         }
 
-        auto actions = maniac::to_actions(hit_objects, osu.get_game_time());
+        const auto start_time = osu.get_game_time();
+        std::cout << "[Maniac] Converting to actions at current game time: " << start_time << " ms" << std::endl;
+
+        auto actions = maniac::to_actions(hit_objects, start_time);
+        std::cout << "[Maniac] Generated " << actions.size() << " key actions. Starting playback loop..." << std::endl;
 
         message = "playing";
 
         maniac::play(actions);
+
+        std::cout << "[Maniac] Finished playing current map." << std::endl;
 
         set_priority_class(NORMAL_PRIORITY_CLASS);
     };
@@ -87,13 +108,16 @@ int main(int, char **) {
     auto thread = std::jthread([&message, &run](const std::stop_token& token) {
         while (!token.stop_requested()) {
             try {
+                std::cout << "[Maniac] Scanning for osu! process and signatures..." << std::endl;
                 auto osu = osu::Osu();
+                std::cout << "[Maniac] Connected to osu! process." << std::endl;
 
                 while (!token.stop_requested()) {
                     run(osu);
                 }
             } catch (std::exception &err) {
                 (message = err.what()).append(" (retrying in 2 seconds)");
+                std::cout << "[Maniac Error] " << err.what() << " (retrying in 2s)" << std::endl;
 
                 std::this_thread::sleep_for(std::chrono::seconds(2));
             }
@@ -148,4 +172,3 @@ int main(int, char **) {
 
     return EXIT_SUCCESS;
 }
-
