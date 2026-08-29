@@ -3,12 +3,12 @@
 #include <maniac/signature.h>
 
 namespace signatures {
-    // Song Time (using the full 8-byte anchor to guarantee uniqueness)
-    const auto time = Signature{ "B8 01 00 00 00 EB 00 A3 ? ? ? ?", 8 };
+    // Base anchor pattern (used for AudioTime)
+    const auto base = Signature{ "F8 01 74 04 83 65", 0 };
 
-    // Player / Ruleset pointer
-    const auto player = Signature{ "FF 50 0C A1 ? ? ? ? 85 C0 74 ? 8B 40", 4 };
+    // Status pattern
+    const auto status = Signature{ "48 83 F8 04 73 1E", 0 };
 
-    // Osu Status / Game Mode
-    const auto status = Signature{ "A1 ? ? ? ? 8D 50 ? A1 ? ? ? ? 85 C0 74 ? 8B 40", 1 };
+    // CurrentRuleset / Player pattern
+    const auto ruleset = Signature{ "C7 86 48 01 00 00 01 00 00 00 A1", 0 };
 }
