@@ -195,8 +195,8 @@ void window::start(const std::function<void()> &body) {
 
         body();
 
-	maniac::config.tap_time = max(0, maniac::config.tap_time);
-	maniac::config.humanization_modifier = max(0, maniac::config.humanization_modifier);
+        maniac::config.tap_time = std::max(0, maniac::config.tap_time);
+        maniac::config.humanization_modifier = std::max(0, maniac::config.humanization_modifier);
 
         ImGui::EndFrame();
         g_pd3dDevice->SetRenderState(D3DRS_ZENABLE, FALSE);
