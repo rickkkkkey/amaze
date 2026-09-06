@@ -43,7 +43,8 @@ namespace maniac {
     void block_until_playing();
 
     void randomize(std::vector<osu::HitObject> &hit_objects, int mean, int stddev);
-    void humanize_dynamic(std::vector<osu::HitObject> &hit_objects, int modifier);
+    void humanize_dynamic(std::vector<osu::HitObject> &hit_objects, int modifier,
+                          double judgment_window_ms = 34.0, double approach_time_ms = 600.0);
 
     std::vector<Action> to_actions(std::vector<osu::HitObject> &hit_objects, int32_t min_time);
 }
