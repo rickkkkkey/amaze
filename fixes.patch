@@ -1,0 +1,851 @@
+--- a/app/app.cpp
++++ b/app/app.cpp
+@@ -2,8 +2,11 @@
+ #include "config.h"
+ #include <maniac/maniac.h>
+ #include <windows.h>
++#include <timeapi.h>
+ #include <iostream>
+ #include <cstdio>
++#include <cstring>
++#include <cctype>
+ #include <algorithm>
+ 
+ static void help_marker(const char *desc) {
+@@ -35,6 +38,64 @@
+             GetPriorityClass(proc));
+ }
+ 
++// Maps a virtual-key code to the character stored in the keybind string.
++// Returns '\0' for keys that can't be used as mania keys.
++static char vk_to_config_char(int vk) {
++    if (vk == VK_SPACE)
++        return ' ';
++
++    const UINT ch = MapVirtualKeyA(static_cast<UINT>(vk), MAPVK_VK_TO_CHAR) & 0x7FFFu;
++
++    if (ch >= 'A' && ch <= 'Z')
++        return static_cast<char>(ch - 'A' + 'a');
++    if ((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'z'))
++        return static_cast<char>(ch);
++
++    switch (ch) {
++        case ';': case '\'': case ',': case '.': case '/':
++        case '[': case ']': case '-': case '=': case '`': case '\\':
++            return static_cast<char>(ch);
++        default:
++            return '\0';
++    }
++}
++
++static bool validate_keys(const char *buf, std::string &err) {
++    const size_t len = std::strlen(buf);
++
++    if (len < 4) {
++        err = "Need at least 4 keys.";
++        return false;
++    }
++    if (len > 16) {
++        err = "Keep it to 16 keys max.";
++        return false;
++    }
++    if (len % 2 != 0) {
++        err = "Use an even number of keys (odd column counts add a center space automatically).";
++        return false;
++    }
++
++    bool seen[256] = {};
++    for (size_t i = 0; i < len; ++i) {
++        const unsigned char uc = static_cast<unsigned char>(buf[i]);
++        if (buf[i] == ' ' || !std::isprint(uc)) {
++            err = "Keys must be printable characters (no spaces).";
++            return false;
++        }
++        const unsigned char lower = static_cast<unsigned char>(std::tolower(uc));
++        if (seen[lower]) {
++            (err = "Duplicate key: '").push_back(static_cast<char>(lower));
++            err.push_back('\'');
++            err.push_back('.');
++            return false;
++        }
++        seen[lower] = true;
++    }
++
++    return true;
++}
++
+ int main(int, char **) {
+     // Open a debug console window alongside the UI
+     AllocConsole();
+@@ -43,17 +104,22 @@
+     freopen_s(&fDummy, "CONOUT$", "w", stderr);
+     std::cout << "=== Maniac Debug Console Initialized ===" << std::endl;
+ 
++    // 1 ms timer granularity for the whole process: without this, sleeps can
++    // overshoot by ~15 ms, which would wreck the adaptive sleep in play().
++    timeBeginPeriod(1);
++
+     std::string message;
+ 
+     config::read_from_file(maniac::config);
+ 
+-    auto run = [&message](osu::Osu &osu) {
++    auto run = [&message](osu::Osu &osu, const std::stop_token &token) {
+         maniac::osu = &osu;
+ 
+         message = "waiting for beatmap...";
+         std::cout << "[Maniac] Waiting for playing status (current status: " << osu.get_status() << ")..." << std::endl;
+ 
+-        maniac::block_until_playing();
++        if (!maniac::block_until_playing(token))
++            return;
+ 
+         message = "found beatmap";
+         std::cout << "[Maniac] Entered gameplay! Resolving hit objects..." << std::endl;
+@@ -81,9 +147,9 @@
+ 
+         // Print first 3 hit objects for sanity check
+         for (size_t i = 0; i < (std::min)(static_cast<size_t>(3), hit_objects.size()); ++i) {
+-            std::cout << "[Maniac::Debug] Note " << i 
+-                      << " -> Column: " << hit_objects[i].column 
+-                      << " | Start: " << hit_objects[i].start_time 
++            std::cout << "[Maniac::Debug] Note " << i
++                      << " -> Column: " << hit_objects[i].column
++                      << " | Start: " << hit_objects[i].start_time
+                       << " | End: " << hit_objects[i].end_time << std::endl;
+         }
+ 
+@@ -103,17 +169,30 @@
+ 
+         message = "playing";
+ 
+-        std::cout << "[Maniac::Debug] Current live game time right before play(): " 
++        std::cout << "[Maniac::Debug] Current live game time right before play(): "
+                   << osu.get_game_time() << " ms" << std::endl;
+ 
+-        maniac::play(actions);
++        const auto result = maniac::play(actions, token);
+ 
+         std::cout << "[Maniac] Finished playing current map." << std::endl;
+ 
+         set_priority_class(NORMAL_PRIORITY_CLASS);
++
++        if (result == maniac::PlayResult::Finished) {
++            // The song is still in "playing" state during the outro, so wait
++            // until it actually ends. Otherwise we'd instantly reload the same
++            // map and spin. On stop/retry we loop immediately to pick up the
++            // new map without missing the intro.
++            message = "waiting for next beatmap...";
++            if (!maniac::block_until_not_playing(token))
++                return;
++        }
+     };
+ 
+     auto thread = std::jthread([&message, &run](const std::stop_token& token) {
++        // Keep input timing stable even when the system is loaded.
++        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
++
+         while (!token.stop_requested()) {
+             try {
+                 std::cout << "[Maniac] Scanning for osu! process and signatures..." << std::endl;
+@@ -121,7 +200,18 @@
+                 std::cout << "[Maniac] Connected to osu! process." << std::endl;
+ 
+                 while (!token.stop_requested()) {
+-                    run(osu);
++                    try {
++                        run(osu, token);
++                    } catch (std::exception &err) {
++                        // Transient map-load failure (objects not ready yet,
++                        // bad key config, ...): show it and retry quickly
++                        // WITHOUT throwing away the osu! handle and rescanning
++                        // all signatures. Fixing keys in the GUI recovers live.
++                        (message = err.what()).append(" (retrying...)");
++                        std::cout << "[Maniac Error] " << err.what() << " (retrying...)" << std::endl;
++
++                        std::this_thread::sleep_for(std::chrono::milliseconds(500));
++                    }
+                 }
+             } catch (std::exception &err) {
+                 (message = err.what()).append(" (retrying in 2 seconds)");
+@@ -162,6 +252,124 @@
+         ImGui::SameLine();
+         help_marker("How long a key is held down for a single keypress, in milliseconds.");
+ 
++        ImGui::InputInt("Hold jitter", &maniac::config.hold_jitter);
++        ImGui::SameLine();
++        help_marker("Per-note hold-duration variation (stddev, ms). Humans never hold every note for "
++                    "identical milliseconds; 0 restores fixed tap-time holds.");
++
++        horizontal_break();
++
++        // ---- Keybinds editor (saved to maniac-config.json, no manual editing needed) ----
++        ImGui::Text("Keybinds");
++        ImGui::SameLine();
++        help_marker("Gameplay keys, left to right. Applied live and saved to maniac-config.json. "
++                    "Use an even number of keys; odd column counts automatically use a center space. "
++                    "Click a slot, then press the key you want there.");
++
++        static char keys_buf[32] = "";
++        static bool keys_buf_init = false;
++        if (!keys_buf_init) {
++            std::strncpy(keys_buf, maniac::config.keys.c_str(), sizeof(keys_buf) - 1);
++            keys_buf[sizeof(keys_buf) - 1] = '\0';
++            keys_buf_init = true;
++        }
++
++        static int capturing = -1;
++        static ULONGLONG capture_armed_at = 0;
++        static std::string keybind_msg;
++
++        const size_t key_len = std::strlen(keys_buf);
++        for (size_t i = 0; i < key_len; ++i) {
++            std::string display = (keys_buf[i] == ' ') ? "Space" : std::string(1, keys_buf[i]);
++            display += "##key";
++            display += std::to_string(i);
++
++            if (capturing == static_cast<int>(i))
++                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(1.0f, 0.55f, 0.0f, 1.0f));
++
++            if (ImGui::Button(display.c_str(), ImVec2(0, 0))) {
++                capturing = static_cast<int>(i);
++                capture_armed_at = GetTickCount64();
++                // Flush stale "pressed since last call" bits so a key tapped
++                // just before clicking isn't captured by mistake.
++                for (int vk = 0x08; vk <= 0xFE; ++vk)
++                    (void)GetAsyncKeyState(vk);
++            }
++
++            if (capturing == static_cast<int>(i))
++                ImGui::PopStyleColor();
++
++            if (i + 1 < key_len)
++                ImGui::SameLine();
++        }
++
++        if (capturing >= 0) {
++            ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.0f, 1.0f),
++                "Press a key for slot %d... (Esc cancels)", capturing + 1);
++
++            if (GetTickCount64() - capture_armed_at < 250) {
++                // Brief arm delay: lets the user release the mouse / settle.
++            } else if (GetAsyncKeyState(VK_ESCAPE) & 1) {
++                capturing = -1;
++            } else {
++                for (int vk = 0x08; vk <= 0xFE; ++vk) {
++                    if (vk == VK_ESCAPE)
++                        continue;
++                    if (GetAsyncKeyState(vk) & 1) {
++                        const char c = vk_to_config_char(vk);
++                        if (c) {
++                            keys_buf[capturing] = c;
++                            keybind_msg.clear();
++                        } else {
++                            keybind_msg = "That key can't be used as a mania key.";
++                        }
++                        capturing = -1;
++                        break;
++                    }
++                }
++            }
++        }
++
++        ImGui::Dummy(ImVec2(0.0f, 2.0f));
++
++        if (ImGui::Button("Apply keybinds")) {
++            std::string err;
++            if (!validate_keys(keys_buf, err)) {
++                keybind_msg = err;
++            } else {
++                std::string normalized = keys_buf;
++                std::transform(normalized.begin(), normalized.end(), normalized.begin(),
++                    [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
++                std::strncpy(keys_buf, normalized.c_str(), sizeof(keys_buf) - 1);
++                maniac::config.keys = normalized;
++                config::write_to_file(maniac::config);
++                keybind_msg = "Keybinds saved.";
++                std::cout << "[Maniac] Keybinds updated to \"" << normalized << "\"" << std::endl;
++            }
++        }
++        ImGui::SameLine();
++        if (ImGui::Button("Reset to default")) {
++            std::strncpy(keys_buf, "asdfjkl;", sizeof(keys_buf) - 1);
++            maniac::config.keys = keys_buf;
++            config::write_to_file(maniac::config);
++            capturing = -1;
++            keybind_msg = "Keybinds reset to default.";
++        }
++
++        if (!keybind_msg.empty())
++            ImGui::TextDisabled("%s", keybind_msg.c_str());
++
++        ImGui::Dummy(ImVec2(0.0f, 2.0f));
++        ImGui::Text("Preview:");
++        for (int cols = 4; cols <= 9; ++cols) {
++            try {
++                const auto sub = osu::Osu::get_key_subset(keys_buf, cols);
++                ImGui::Text("  %dK: %s", cols, sub.c_str());
++            } catch (const std::exception &) {
++                ImGui::Text("  %dK: (not enough keys)", cols);
++            }
++        }
++
+         horizontal_break();
+         ImGui::Dummy(ImVec2(0.0f, 5.0f));
+ 
+@@ -174,5 +382,7 @@
+ 
+     thread.request_stop();
+ 
++    timeEndPeriod(1);
++
+     return EXIT_SUCCESS;
+ }
+--- a/app/config.h
++++ b/app/config.h
+@@ -19,18 +19,26 @@
+     try {
+         const auto data = json::parse(file);
+ 
+-        c.tap_time = data["tap_time"];
+-        c.mirror_mod = data["mirror_mod"];
+-        c.compensation_offset = data["compensation_offset"];
+-        c.randomization_mean = data["randomization_mean"];
+-        c.randomization_stddev = data["randomization_stddev"];
+-        c.humanization_type = data["humanization_type"];
+-        c.humanization_modifier = data["humanization_modifier"];
+-        c.keys = data["keys"];
++        // value() keeps the in-code defaults when a field is missing instead
++        // of throwing, so hand-edited or older config files can't break startup.
++        c.tap_time = data.value("tap_time", c.tap_time);
++        c.hold_jitter = data.value("hold_jitter", c.hold_jitter);
++        c.mirror_mod = data.value("mirror_mod", c.mirror_mod);
++        c.compensation_offset = data.value("compensation_offset", c.compensation_offset);
++        c.randomization_mean = data.value("randomization_mean", c.randomization_mean);
++        c.randomization_stddev = data.value("randomization_stddev", c.randomization_stddev);
++        c.humanization_type = data.value("humanization_type", c.humanization_type);
++        c.humanization_modifier = data.value("humanization_modifier", c.humanization_modifier);
++
++        const auto keys = data.value("keys", c.keys);
++        if (!keys.empty())
++            c.keys = keys;
+ 
+         debug("loaded config from file");
+     } catch (json::parse_error &err) {
+         debug("failed parsing config: '%s'", err.what());
++    } catch (json::type_error &err) {
++        debug("invalid config value: '%s'", err.what());
+     }
+ }
+ 
+@@ -38,6 +46,7 @@
+     json data = {
+             {"format_version", format_version},
+             {"tap_time", c.tap_time},
++            {"hold_jitter", c.hold_jitter},
+             {"mirror_mod", c.mirror_mod},
+             {"compensation_offset", c.compensation_offset},
+             {"randomization_mean", c.randomization_mean},
+--- a/app/window.cpp
++++ b/app/window.cpp
+@@ -127,7 +127,7 @@
+             NULL, NULL, NULL, _T("maniac"), NULL};
+     ::RegisterClassEx(&wc);
+     HWND hwnd = ::CreateWindow(wc.lpszClassName, _T("maniac"), WS_OVERLAPPEDWINDOW, 100, 100, 550,
+-            420, NULL, NULL, wc.hInstance, NULL);
++            640, NULL, NULL, wc.hInstance, NULL);
+ 
+     randomize_window_title(hwnd);
+ 
+@@ -196,6 +196,7 @@
+         body();
+ 
+         maniac::config.tap_time = std::max(0, maniac::config.tap_time);
++        maniac::config.hold_jitter = std::max(0, maniac::config.hold_jitter);
+         maniac::config.humanization_modifier = std::max(0, maniac::config.humanization_modifier);
+ 
+         ImGui::EndFrame();
+--- a/app/CMakeLists.txt
++++ b/app/CMakeLists.txt
+@@ -25,6 +25,6 @@
+ target_include_directories(maniac-app PRIVATE dependencies)
+ target_include_directories(maniac-app PRIVATE dependencies/imgui)
+ 
+-target_link_libraries(maniac-app PRIVATE maniac d3d9.lib nlohmann_json::nlohmann_json)
++target_link_libraries(maniac-app PRIVATE maniac d3d9.lib winmm.lib nlohmann_json::nlohmann_json)
+ 
+ set_target_properties(maniac-app PROPERTIES OUTPUT_NAME "maniac")
+--- a/lib/maniac.cpp
++++ b/lib/maniac.cpp
+@@ -1,26 +1,55 @@
+ #include <maniac/maniac.h>
++#include <algorithm>
++#include <climits>
+ #include <iostream>
+ #include <iomanip>
++#include <random>
++#include <unordered_map>
+ 
+ namespace maniac {
+     void reset_keys() {
+-        auto keys = osu::Osu::get_key_subset(config.keys, 9);
+-        for (auto key : keys) {
++        // Release every configured key plus the center-column space that odd
++        // key counts map to, deduplicated. The old version only released a
++        // fixed 9-key subset, which could leave keys held after an abort.
++        std::string all = config.keys;
++        if (all.find(' ') == std::string::npos)
++            all.push_back(' ');
++
++        std::sort(all.begin(), all.end());
++        all.erase(std::unique(all.begin(), all.end()), all.end());
++
++        for (auto key : all) {
+             Process::send_keypress(key, false);
+         }
+     }
+ 
+-	void block_until_playing() {
+-		while (true) {
++	bool block_until_playing(const std::stop_token &token) {
++		while (!token.stop_requested()) {
+ 			if (osu->is_playing()) {
+-                break;
++                return true;
+             }
+ 
+-            std::this_thread::sleep_for(std::chrono::milliseconds(250));
++            // Poll fast: the old 250 ms cadence could eat the first notes of
++            // a map before the action list was even built.
++            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+ 		}
++
++        return false;
+ 	}
+ 
+-	void play(const std::vector<Action> &actions) {
++    bool block_until_not_playing(const std::stop_token &token) {
++        while (!token.stop_requested()) {
++            if (!osu->is_playing()) {
++                return true;
++            }
++
++            std::this_thread::sleep_for(std::chrono::milliseconds(250));
++        }
++
++        return false;
++    }
++
++	PlayResult play(const std::vector<Action> &actions, const std::stop_token &token) {
+ 		reset_keys();
+ 
+ 		size_t cur_i = 0;
+@@ -30,39 +59,91 @@
+ 
+ 		std::cout << "[Maniac::Play] Started playback loop for " << total_actions << " actions." << std::endl;
+ 
+-		int loop_ticks = 0;
++		// A retry keeps osu! in the Playing state but rewinds the audio clock
++		// and spawns a fresh player object. Track both so we can abandon the
++		// stale action list and let the caller reload the new map instead of
++		// sitting past the end of the old cursor in silence.
++		constexpr int32_t RESTART_BACKJUMP_MS = 250;
++		constexpr int MAX_TIME_FAILURES = 2000;  // ~2s of unreadable clock
++
++		uintptr_t known_player = osu->get_player();
++		auto prev_time = osu->get_game_time();
++		int time_failures = 0;
+ 
+ 		while (cur_i < total_actions) {
+-			if (!osu->is_playing()) {
++			if (token.stop_requested() || !osu->is_playing()) {
+ 				std::cout << "[Maniac::Play] osu! is no longer in playing state. Exiting play loop." << std::endl;
+-				return;
++				reset_keys();
++				return PlayResult::Stopped;
++			}
++
++			const auto cur_player = osu->get_player();
++			if (cur_player != 0) {
++				if (known_player != 0 && cur_player != known_player) {
++					std::cout << "[Maniac::Play] New player object detected (song restarted). Reloading." << std::endl;
++					reset_keys();
++					return PlayResult::Restarted;
++				}
++				known_player = cur_player;
+ 			}
+ 
+ 			cur_time = osu->get_game_time();
+ 
+-			// Periodic live heartbeat log to check if time is updating
+-			if (++loop_ticks % 2000 == 0) {
+-				std::cout << "[Maniac::Play] Live Time: " << cur_time 
+-				          << " ms | Next Action Time: " << (raw_actions + cur_i)->time 
+-				          << " ms | Action: " << cur_i << "/" << total_actions << std::endl;
++			if (cur_time < 0) {
++				if (++time_failures > MAX_TIME_FAILURES) {
++					std::cout << "[Maniac::Play] Game clock unreadable, giving up on this run." << std::endl;
++					reset_keys();
++					return PlayResult::Stopped;
++				}
++				std::this_thread::sleep_for(std::chrono::milliseconds(1));
++				continue;
+ 			}
++			time_failures = 0;
++
++			if (cur_time + RESTART_BACKJUMP_MS < prev_time) {
++				std::cout << "[Maniac::Play] Clock jumped backwards (" << prev_time
++				          << " -> " << cur_time << " ms, song restarted). Reloading." << std::endl;
++				reset_keys();
++				return PlayResult::Restarted;
++			}
++			if (cur_time > prev_time)
++				prev_time = cur_time;
+ 
+ 			while (cur_i < total_actions && (raw_actions + cur_i)->time <= cur_time) {
+-				const auto& act = *(raw_actions + cur_i);
+-				
+-				std::cout << "[Maniac::Play] Executing Action: Key '" << act.key 
+-				          << "' (" << (act.down ? "DOWN" : "UP") 
+-				          << ") at Live Time: " << cur_time 
+-				          << " ms (Target: " << act.time << " ms)" << std::endl;
++				// NOTE: per-action logging lives behind debug() on purpose.
++				// Formatted console I/O costs ~100us+ per call and used to run
++				// on every note, delaying inputs past their target time and
++				// spreading chords apart. Release builds stay silent here.
++				debug("exec key '%c' %s target %d live %d",
++					(raw_actions + cur_i)->key,
++					(raw_actions + cur_i)->down ? "DOWN" : "UP",
++					(raw_actions + cur_i)->time, cur_time);
+ 
+ 				(raw_actions + cur_i)->execute();
+ 				cur_i++;
+ 			}
+ 
++			if (cur_i < total_actions) {
++				const int32_t wait_ms = (raw_actions + cur_i)->time - cur_time;
++				if (wait_ms > 6) {
++					// Next note is far off: sleep most of the gap instead of
++					// busy-polling ReadProcessMemory at 100% CPU, but wake at
++					// least every 100 ms so a retry/menu exit is noticed
++					// promptly. Tight polling resumes ~3 ms before the note
++					// (requires the 1 ms timer resolution set in main).
++					const auto chunk = (std::min)(wait_ms - 3, 100);
++					std::this_thread::sleep_for(std::chrono::milliseconds(chunk));
++					continue;
++				}
++			}
++
+ 			std::this_thread::sleep_for(std::chrono::nanoseconds(100));
+ 		}
+ 
+ 		std::cout << "[Maniac::Play] All actions executed successfully." << std::endl;
++
++		reset_keys();
++		return PlayResult::Finished;
+ 	}
+ 
+     std::vector<Action> to_actions(std::vector<osu::HitObject> &hit_objects, int32_t min_time) {
+@@ -74,7 +155,7 @@
+                                               hit_objects.end(), [](auto a, auto b) {
+                     return a.column < b.column; })->column + 1;
+ 
+-        std::cout << "[Maniac::to_actions] Detected max column index: " << (columns - 1) 
++        std::cout << "[Maniac::to_actions] Detected max column index: " << (columns - 1)
+                   << " (Total columns: " << columns << ")" << std::endl;
+ 
+         auto keys = osu::Osu::get_key_subset(config.keys, columns);
+@@ -83,15 +164,67 @@
+         if (config.mirror_mod)
+             std::reverse(keys.begin(), keys.end());
+ 
++        // Per-note hold durations: humans never hold every note for identical
++        // milliseconds, so jitter each tap hold around tap_time. Consecutive
++        // holds are mildly correlated (sticky fingers), and every release is
++        // clamped so a hold can neither vanish nor swallow the next press on
++        // the same column (which would drop the re-trigger and miss).
++        // Sliders keep their real (already humanized) durations.
++        std::vector<int32_t> tap_release(hit_objects.size(), INT32_MIN);
++        if (config.hold_jitter > 0) {
++            thread_local std::mt19937 gen{std::random_device{}()};
++
++            std::unordered_map<int, std::vector<size_t>> by_column;
++            for (size_t i = 0; i < hit_objects.size(); ++i) {
++                if (!hit_objects[i].is_slider)
++                    by_column[hit_objects[i].column].push_back(i);
++            }
++
++            for (auto &[column, idxs] : by_column) {
++                (void)column;
++                std::sort(idxs.begin(), idxs.end(), [&](size_t a, size_t b) {
++                    return hit_objects[a].start_time < hit_objects[b].start_time;
++                });
++
++                double prev_j = 0.0;
++                bool has_prev = false;
++                for (size_t k = 0; k < idxs.size(); ++k) {
++                    auto &ho = hit_objects[idxs[k]];
++
++                    std::normal_distribution<> distr{0.0, static_cast<double>(config.hold_jitter)};
++                    const double raw = distr(gen);
++                    const double j = has_prev ? 0.3 * prev_j + 0.7 * raw : raw;
++                    prev_j = j;
++                    has_prev = true;
++
++                    int32_t release = ho.start_time + config.tap_time + static_cast<int32_t>(std::round(j));
++                    if (release < ho.start_time + 5)
++                        release = ho.start_time + 5;
++                    if (k + 1 < idxs.size()) {
++                        // Leave at least 2 ms for the key to come back up.
++                        const int32_t latest = hit_objects[idxs[k + 1]].start_time - 2;
++                        if (release > latest)
++                            release = (std::max)(latest, ho.start_time + 1);
++                    }
++                    tap_release[idxs[k]] = release;
++                }
++            }
++        }
++
+         std::vector<Action> actions;
+         actions.reserve(hit_objects.size() * 2);
+ 
+-        for (auto &hit_object : hit_objects) {
++        for (size_t i = 0; i < hit_objects.size(); ++i) {
++            auto &hit_object = hit_objects[i];
++
+             if (hit_object.start_time < min_time)
+                 continue;
+ 
+-            if (!hit_object.is_slider)
+-                hit_object.end_time = hit_object.start_time + config.tap_time;
++            if (!hit_object.is_slider) {
++                hit_object.end_time = (tap_release[i] != INT32_MIN)
++                    ? tap_release[i]
++                    : hit_object.start_time + config.tap_time;
++            }
+ 
+             if (hit_object.column >= 0 && static_cast<size_t>(hit_object.column) < keys.size()) {
+                 actions.emplace_back(keys[hit_object.column], true,
+@@ -99,13 +232,13 @@
+                 actions.emplace_back(keys[hit_object.column], false,
+                     hit_object.end_time + config.compensation_offset);
+             } else {
+-                std::cout << "[Maniac::to_actions] Warning: Note with invalid column index: " 
++                std::cout << "[Maniac::to_actions] Warning: Note with invalid column index: "
+                           << hit_object.column << std::endl;
+             }
+         }
+ 
+         debug("converted %d hit objects to %d actions", hit_objects.size(), actions.size());
+-        std::cout << "[Maniac::to_actions] Converted " << hit_objects.size() 
++        std::cout << "[Maniac::to_actions] Converted " << hit_objects.size()
+                   << " hit objects to " << actions.size() << " raw actions." << std::endl;
+ 
+         std::sort(actions.begin(), actions.end());
+--- a/lib/osu.cpp
++++ b/lib/osu.cpp
+@@ -3,18 +3,31 @@
+ 
+ using namespace osu;
+ 
++namespace {
++	// Signature scanning over the whole address space is slow (seconds on
++	// large processes). The anchors live in the game module, so try that
++	// first and only fall back to a full scan when it misses.
++	uintptr_t find_signature_fast(const Process &proc, const Signature &sig) {
++		if (const auto scoped = proc.find_signature(sig, "osu!.exe")) {
++			return scoped;
++		}
++
++		return proc.find_signature(sig);
++	}
++}
++
+ Osu::Osu() : Process("osu!.exe") {
+ 	using namespace signatures;
+ 
+-	base_address = find_signature(signatures::base);
++	base_address = find_signature_fast(*this, signatures::base);
+ 	debug("found base address: %#x", base_address);
+ 	std::cout << "[Maniac::Osu] Base address: 0x" << std::hex << base_address << std::dec << std::endl;
+ 
+-	status_address = find_signature(signatures::status);
++	status_address = find_signature_fast(*this, signatures::status);
+ 	debug("found status address: %#x", status_address);
+ 	std::cout << "[Maniac::Osu] Status address: 0x" << std::hex << status_address << std::dec << std::endl;
+ 
+-	ruleset_address = find_signature(signatures::ruleset);
++	ruleset_address = find_signature_fast(*this, signatures::ruleset);
+ 	debug("found ruleset address: %#x", ruleset_address);
+ 	std::cout << "[Maniac::Osu] Ruleset address: 0x" << std::hex << ruleset_address << std::dec << std::endl;
+ 
+@@ -31,15 +44,15 @@
+ 	// CurrentRuleset: dereference [ruleset_address + 0xB], then read pointer at + 0x4
+ 	uintptr_t ruleset_instance = 0;
+ 	if (!read_memory<uintptr_t>(ruleset_address + 0xB, &ruleset_instance) || !ruleset_instance) {
+-		std::cout << "[Maniac::Osu] Failed reading ruleset instance pointer at 0x"
+-		          << std::hex << (ruleset_address + 0xB) << std::dec << std::endl;
++		debug("%s %#x", "failed reading ruleset instance at",
++			(unsigned int)(ruleset_address + 0xB));
+ 		return 0;
+ 	}
+ 
+ 	uintptr_t player = 0;
+ 	if (!read_memory<uintptr_t>(ruleset_instance + 0x4, &player) || !player) {
+-		std::cout << "[Maniac::Osu] Failed reading player pointer at 0x"
+-		          << std::hex << (ruleset_instance + 0x4) << std::dec << std::endl;
++		debug("%s %#x", "failed reading player pointer at",
++			(unsigned int)(ruleset_instance + 0x4));
+ 		return 0;
+ 	}
+ 
+@@ -55,35 +68,39 @@
+ 		throw std::runtime_error("got negative column count");
+ 	}
+ 
+-	const size_t key_subset_len = column_count + 1;
+-	char *const key_subset = reinterpret_cast<char *>(malloc(key_subset_len));
+-
+-	if (!key_subset) {
+-		throw std::runtime_error("failed allocating memory");
+-	}
++	if (column_count % 2 == 0) {
++		// Even key counts use a contiguous window centered in the key string.
++		const auto need = static_cast<size_t>(column_count);
++		if (keys.size() < need) {
++			throw std::runtime_error("not enough keys configured for this key count");
++		}
+ 
+-	key_subset[column_count] = '\0';
++		const size_t offset = keys.size() / 2 - need / 2;
+ 
+-	const size_t subset_offset = (keys.length() / 2) - (column_count / 2);
+-
+-	memmove_s(key_subset, key_subset_len, reinterpret_cast<const void *>(keys.data() + subset_offset),
+-		keys.length() - (subset_offset * 2));
+-
+-	if (column_count % 2) {
+-		auto offset = column_count / 2;
+-		memmove_s(key_subset + offset + 1, key_subset_len + offset + 1, key_subset + offset,
+-			offset);
++		return keys.substr(offset, need);
++	}
+ 
+-		key_subset[column_count / 2] = ' ';
++	// Odd key counts use one key fewer than columns plus a center space
++	// (thumb column), e.g. 8 configured keys cover 9 columns.
++	const auto need = static_cast<size_t>(column_count - 1);
++	if (keys.size() < need) {
++		throw std::runtime_error("not enough keys configured for this key count");
+ 	}
+ 
+-	auto out_string = std::string{key_subset};
+-	free(key_subset);
++	const size_t offset = keys.size() / 2 - need / 2;
++	const std::string window = keys.substr(offset, need);
++	const size_t half = need / 2;
+ 
+-	return out_string;
++	std::string out;
++	out.reserve(static_cast<size_t>(column_count));
++	out.append(window.substr(0, half));
++	out.push_back(' ');
++	out.append(window.substr(half));
++
++	return out;
+ }
+ 
+-std::vector<HitObject> Osu::get_hit_objects() {
++std::vector<HitObject> Osu::get_hit_objects(int depth) {
+ 	internal::process = this;
+ 
+ 	const auto player_address = get_player();
+@@ -106,9 +123,13 @@
+ 		std::cout << "[Maniac::Osu] map_player failed: " << err.what()
+ 		          << " (rescanning ruleset signature)" << std::endl;
+ 
++		if (depth >= 5) {
++			throw std::runtime_error("could not map player after rescanning ruleset");
++		}
++
+ 		debug("failed getting map player, rescanning ruleset");
+-		ruleset_address = find_signature(signatures::ruleset);
++		ruleset_address = find_signature_fast(*this, signatures::ruleset);
+ 
+-		return get_hit_objects();
++		return get_hit_objects(depth + 1);
+ 	}
+ }
+--- a/lib/include/maniac/maniac.h
++++ b/lib/include/maniac/maniac.h
+@@ -4,6 +4,7 @@
+ #include <maniac/config.h>
+ #include <maniac/common.h>
+ 
++#include <stop_token>
+ #include <vector>
+ 
+ namespace maniac {
+@@ -21,7 +22,12 @@
+         };
+ 
+         bool operator < (const Action &action) const {
+-            return time < action.time;
++            if (time != action.time)
++                return time < action.time;
++            // Releases sort before presses at the same timestamp so that
++            // jacks (release + immediate re-press of the same key) retrigger
++            // instead of ending stuck in the released state.
++            return down < action.down;
+         };
+ 
+         bool operator == (const Action &action) const {
+@@ -38,9 +44,23 @@
+ 
+     inline osu::Osu *osu;
+ 
+-    void play(const std::vector<Action> &actions);
++    enum class PlayResult {
++        Finished,   // every action was consumed
++        Stopped,    // left playing state (song end / exit to menu / shutdown)
++        Restarted,  // same-song retry detected (clock jumped back / new player)
++    };
++
++    PlayResult play(const std::vector<Action> &actions,
++                    const std::stop_token &token = {});
++
++    // Returns false when stop was requested while waiting.
++    bool block_until_playing(const std::stop_token &token = {});
++
++    bool block_until_not_playing(const std::stop_token &token = {});
+ 
+-    void block_until_playing();
++    // Releases every configured key (plus the center space used on odd key
++    // counts) so no key can stick after an aborted playback.
++    void reset_keys();
+ 
+     void randomize(std::vector<osu::HitObject> &hit_objects, int mean, int stddev);
+     void humanize_dynamic(std::vector<osu::HitObject> &hit_objects, int modifier,
+--- a/lib/include/maniac/osu.h
++++ b/lib/include/maniac/osu.h
+@@ -34,7 +34,7 @@
+ 
+ 		bool is_playing();
+ 
+-		std::vector<HitObject> get_hit_objects();
++		std::vector<HitObject> get_hit_objects(int depth = 0);
+ 
+ 		static std::string get_key_subset(const std::string &keys, int column_count);
+ 	};
+--- a/lib/include/maniac/config.h
++++ b/lib/include/maniac/config.h
+@@ -13,6 +13,9 @@
+         static constexpr auto DYNAMIC_HUMANIZATION = 1;
+ 
+         int tap_time = 20;
++        // Per-note hold-duration jitter (stddev, ms). Human holds are never a
++        // metronomic constant; 0 restores the legacy fixed tap_time holds.
++        int hold_jitter = 8;
+         bool mirror_mod = false;
+         int compensation_offset = -15;
+         int humanization_modifier = 0;
